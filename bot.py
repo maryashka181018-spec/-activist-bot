@@ -1,23 +1,24 @@
-import os
-import json
-import csv
-import io
-from datetime import datetime
+import os, json, csv, io, asyncio
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
-DATA_FILE = "data.json"
+BOT_TOKEN  = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS  = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
+GROUP_NAME = os.getenv("GROUP_NAME", "ТК МЕДИА/ПРОФЕССИОНАЛИТЕТ")
+DATA_FILE  = "data.json"
 
 (
     WAIT_EVENT_TITLE, WAIT_EVENT_DATE, WAIT_EVENT_LOCATION, WAIT_ROLES,
-    WAIT_FIO, WAIT_GROUP, CHOOSE_EVENT, CHOOSE_ROLE,
-    WAIT_MEMBER_NAME, WAIT_MEMBER_GROUP, WAIT_CERT_LINK,
-) = range(11)
+    WAIT_REG_FIO, WAIT_MEMBER_NAME, WAIT_MEMBER_GROUP,
+    WAIT_CERT_LINK, WAIT_GROUP_LINK,
+    CHOOSE_EVENT, CHOOSE_ROLE,
+    WAIT_REMOVE_COMMENT,
+) = range(12)
 
 ROLE_DESCRIPTIONS = {
     "Фотограф": (
@@ -41,8 +42,8 @@ ROLE_DESCRIPTIONS = {
         "Ты — мозг команды на мероприятии. Следишь за тем, чтобы:\n"
         "• фотограф снимал нужные моменты\n"
         "• корреспондент взял нужные интервью и рассказал на камеру о сегодняшнем дне\n"
-        "• видеографы, чтоб снимали, не упустили ключевые кадры, не отвлекались\n"
-        "• в конце определяешь кто монтирует материал и отправляешь короткий текст о сегодняшнем мероприятии\n\n"
+        "• видеографы снимали, не упускали ключевые кадры, не отвлекались\n"
+        "• в конце определяешь кто монтирует материал и отправляешь короткий текст о мероприятии\n\n"
         "Без тебя команда — без руля."
     ),
 }
@@ -56,82 +57,160 @@ WELCOME_TEXT = (
     "🎥 *Видеограф* — снимает интересные кадры в паре\n"
     "🎤 *Корреспондент* — рассказывает на камеру о мероприятии и берёт интервью\n"
     "📋 *Ответственный* — контролирует всю команду на месте. Он отвечает за это мероприятие\n\n"
-    "Здесь ты можешь записаться на мероприятие и выбрать свою роль. Вперёд! 🚀"
+    "Для начала нужно пройти быструю регистрацию. Введите ваше ФИО:"
 )
 
-
+# ── Данные ────────────────────────────────────────────────────────────────────
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return {"events": [], "members": [], "cert_link": ""}
+        return {"events": [], "members": [], "cert_link": "", "group_name": GROUP_NAME, "known_users": {}}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if "members" not in data:
-        data["members"] = []
-    if "cert_link" not in data:
-        data["cert_link"] = ""
-    return data
+        d = json.load(f)
+    for k, default in [("members",[]),("cert_link",""),("group_name",GROUP_NAME),("known_users",{})]:
+        if k not in d:
+            d[k] = default
+    return d
 
-def save_data(data):
+def save_data(d):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(d, f, ensure_ascii=False, indent=2)
 
-def next_event_id(data):
+def next_id(data):
     ids = [e["id"] for e in data["events"]]
     return max(ids) + 1 if ids else 1
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+def is_admin(uid): return uid in ADMIN_IDS
+
+def fio_match(a, b):
+    a_parts = a.strip().lower().split()
+    b_parts = b.strip().lower().split()
+    if len(a_parts) >= 2 and len(b_parts) >= 2:
+        return a_parts[0] == b_parts[0] and a_parts[1] == b_parts[1]
+    return SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio() > 0.82
 
 def find_member(data, fio):
-    fio_clean = fio.strip().lower()
     for m in data["members"]:
-        if m["name"].strip().lower() == fio_clean:
+        if fio_match(m["name"], fio):
             return m
     return None
 
+def get_user_reg(data, uid):
+    return data["known_users"].get(str(uid))
 
+def is_already_signed_to_event(ev, telegram_id):
+    """Проверяет записан ли человек уже на любую роль этого мероприятия."""
+    for r in ev["roles"]:
+        if any(s["telegram_id"] == telegram_id for s in r["signups"]):
+            return True
+    return False
+
+def parse_event_datetime(date_str):
+    months = {"января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,
+              "июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12}
+    try:
+        parts = date_str.replace(",", "").split()
+        day = int(parts[0])
+        month = months.get(parts[1].lower(), 0)
+        time_parts = parts[2].split(":") if len(parts) > 2 else ["12","00"]
+        hour, minute = int(time_parts[0]), int(time_parts[1])
+        year = datetime.now().year
+        dt = datetime(year, month, day, hour, minute)
+        if dt < datetime.now():
+            dt = dt.replace(year=year+1)
+        return dt
+    except Exception:
+        return None
+
+# ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if is_admin(user.id):
         data = load_data()
-        cert = data.get("cert_link", "") or "не указана"
+        cert = data.get("cert_link") or "не указана"
         kb = [
-            [InlineKeyboardButton("➕ Добавить мероприятие", callback_data="admin_add")],
-            [InlineKeyboardButton("📋 Список мероприятий", callback_data="admin_list")],
-            [InlineKeyboardButton("👥 Список активистов", callback_data="admin_members")],
-            [InlineKeyboardButton("➕ Добавить активиста", callback_data="admin_add_member")],
-            [InlineKeyboardButton("🔗 Изменить ссылку на справку", callback_data="admin_cert_link")],
-            [InlineKeyboardButton("📥 Выгрузить CSV", callback_data="admin_export")],
+            [InlineKeyboardButton("➕ Добавить мероприятие",   callback_data="admin_add")],
+            [InlineKeyboardButton("📋 Список мероприятий",      callback_data="admin_list")],
+            [InlineKeyboardButton("👥 Список активистов",       callback_data="admin_members")],
+            [InlineKeyboardButton("➕ Добавить активиста",      callback_data="admin_add_member")],
+            [InlineKeyboardButton("🔗 Ссылка на справку",       callback_data="admin_cert_link")],
+            [InlineKeyboardButton("📥 Выгрузить CSV",           callback_data="admin_export")],
         ]
         await update.message.reply_text(
-            f"👋 Привет, {user.first_name}! Вы в режиме организатора.\n\n"
-            f"🔗 Текущая ссылка на справку: {cert}",
+            f"👋 Привет, {user.first_name}! Режим организатора.\n🔗 Справка: {cert}",
             reply_markup=InlineKeyboardMarkup(kb)
         )
+        return ConversationHandler.END
+
+    data = load_data()
+    reg = get_user_reg(data, user.id)
+    if reg:
+        await show_main_menu(update.message, reg["fio"])
+        return ConversationHandler.END
     else:
-        kb = [[InlineKeyboardButton("📅 Записаться на мероприятие", callback_data="signup_start")]]
-        await update.message.reply_text(WELCOME_TEXT, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown")
+        return WAIT_REG_FIO
 
+async def show_main_menu(message, fio):
+    kb = [
+        [InlineKeyboardButton("📅 Мероприятия",      callback_data="signup_start")],
+        [InlineKeyboardButton("📄 Получить справку", callback_data="get_cert")],
+    ]
+    await message.reply_text(
+        f"👋 С возвращением, *{fio}*!\n\nЧто хочешь сделать?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
-# ── Ссылка на справку ────────────────────────────────────────────────────────
+# ── Регистрация ───────────────────────────────────────────────────────────────
+async def got_reg_fio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    fio = update.message.text.strip()
+    user = update.effective_user
+    data = load_data()
+    member = find_member(data, fio)
+    if not member:
+        await update.message.reply_text(
+            "❌ Вас нет в списке активистов медиацентра.\n\n"
+            "Если считаете это ошибкой — обратитесь к руководителю медиацентра."
+        )
+        return WAIT_REG_FIO
+    data["known_users"][str(user.id)] = {
+        "fio": member["name"],
+        "group": member["group"],
+        "telegram_id": user.id,
+        "username": f"@{user.username}" if user.username else "—"
+    }
+    save_data(data)
+    await update.message.reply_text(f"✅ Добро пожаловать, *{member['name']}*!", parse_mode="Markdown")
+    await show_main_menu(update.message, member["name"])
+    return ConversationHandler.END
+
+# ── Справка ───────────────────────────────────────────────────────────────────
+async def get_cert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = load_data()
+    cert = data.get("cert_link", "")
+    if cert:
+        await query.message.reply_text(f"📄 *Справка-подтверждение:*\n{cert}", parse_mode="Markdown")
+    else:
+        await query.message.reply_text("📄 Ссылка пока не добавлена. Обратитесь к руководителю.")
+
+# ── Ссылка на справку ─────────────────────────────────────────────────────────
 async def admin_cert_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = load_data()
-    current = data.get("cert_link", "") or "не указана"
     await query.message.reply_text(
-        f"🔗 Текущая ссылка: {current}\n\nВведите новую ссылку на справку:"
+        f"Текущая ссылка: {data.get('cert_link') or 'не указана'}\n\nВведите новую:"
     )
     return WAIT_CERT_LINK
 
 async def got_cert_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    link = update.message.text.strip()
     data = load_data()
-    data["cert_link"] = link
+    data["cert_link"] = update.message.text.strip()
     save_data(data)
-    await update.message.reply_text(f"✅ Ссылка обновлена!\n{link}")
+    await update.message.reply_text("✅ Ссылка обновлена!")
     return ConversationHandler.END
-
 
 # ── Добавить мероприятие ──────────────────────────────────────────────────────
 async def admin_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -155,7 +234,7 @@ async def got_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["location"] = update.message.text.strip()
     ctx.user_data["roles"] = []
     await update.message.reply_text(
-        "👥 Добавьте роли в формате:\n`Фотограф: 1`\n`Видеограф: 2`\n`Корреспондент: 1`\n`Ответственный: 1`\n\nКаждую роль с новой строки. Затем /done",
+        "👥 Добавьте роли:\n`Фотограф: 1`\n`Видеограф: 2`\n`Корреспондент: 1`\n`Ответственный: 1`\n\nКаждую с новой строки. Затем /done",
         parse_mode="Markdown"
     )
     return WAIT_ROLES
@@ -166,9 +245,7 @@ async def got_roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parts = line.split(":", 1)
             try:
                 ctx.user_data.setdefault("roles", []).append({
-                    "name": parts[0].strip(),
-                    "total": int(parts[1].strip()),
-                    "signups": []
+                    "name": parts[0].strip(), "total": int(parts[1].strip()), "signups": []
                 })
             except ValueError:
                 pass
@@ -181,26 +258,151 @@ async def done_roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return WAIT_ROLES
     data = load_data()
     event = {
-        "id": next_event_id(data),
+        "id": next_id(data),
         "title": ctx.user_data["title"],
         "date": ctx.user_data["date"],
         "location": ctx.user_data["location"],
         "roles": roles,
         "created_at": datetime.now().isoformat(),
-        "active": True
+        "active": True,
+        "reminders_sent": []
     }
     data["events"].append(event)
     save_data(data)
     roles_text = "\n".join(f"  • {r['name']}: {r['total']} чел." for r in roles)
     await update.message.reply_text(
-        f"✅ Мероприятие добавлено!\n\n*{event['title']}*\n📅 {event['date']}\n📍 {event['location']}\n👥 Роли:\n{roles_text}",
+        f"✅ Мероприятие добавлено!\n\n*{event['title']}*\n📅 {event['date']}\n📍 {event['location']}\n{roles_text}",
         parse_mode="Markdown"
     )
+    for uid_str in data.get("known_users", {}):
+        try:
+            await update.get_bot().send_message(
+                chat_id=int(uid_str),
+                text=f"🆕 Новое мероприятие!\n\n*{event['title']}*\n📅 {event['date']}\n📍 {event['location']}\n\nЗапишись через /start",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
     ctx.user_data.clear()
     return ConversationHandler.END
 
+# ── Список мероприятий (орг) ──────────────────────────────────────────────────
+async def admin_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = load_data()
+    events = [e for e in data["events"] if e.get("active")]
+    if not events:
+        await query.message.reply_text("Нет активных мероприятий.")
+        return
+    for ev in events:
+        total = sum(r["total"] for r in ev["roles"])
+        signed = sum(len(r["signups"]) for r in ev["roles"])
+        await query.message.reply_text(
+            f"📌 *{ev['title']}*\n📅 {ev['date']}\n📍 {ev['location']}\n👥 {signed}/{total}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Закрыть мероприятие", callback_data=f"admin_close_{ev['id']}")
+            ]])
+        )
+        for r in ev["roles"]:
+            if not r["signups"]:
+                await query.message.reply_text(f"🎭 *{r['name']}* — никто не записался", parse_mode="Markdown")
+                continue
+            for s in r["signups"]:
+                status = "✅" if s.get("approved") else "⏳"
+                kb = [[InlineKeyboardButton("❌ Удалить", callback_data=f"remove_{ev['id']}_{r['name']}_{s['telegram_id']}")]]
+                if not s.get("approved"):
+                    kb[0].insert(0, InlineKeyboardButton("✅ Принять", callback_data=f"approve_{ev['id']}_{r['name']}_{s['telegram_id']}"))
+                await query.message.reply_text(
+                    f"{status} *{r['name']}*: {s['fio']} — {s['group']}",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
 
-# ── Добавить активиста ────────────────────────────────────────────────────────
+async def approve_signup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, ev_id, role_name, tg_id = query.data.split("_", 3)
+    ev_id, tg_id = int(ev_id), int(tg_id)
+    data = load_data()
+    for ev in data["events"]:
+        if ev["id"] == ev_id:
+            for r in ev["roles"]:
+                if r["name"] == role_name:
+                    for s in r["signups"]:
+                        if s["telegram_id"] == tg_id:
+                            s["approved"] = True
+                            save_data(data)
+                            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("❌ Удалить", callback_data=f"remove_{ev_id}_{role_name}_{tg_id}")
+                            ]]))
+                            await query.message.reply_text(f"✅ {s['fio']} подтверждён.")
+                            try:
+                                await query.get_bot().send_message(
+                                    chat_id=tg_id,
+                                    text=f"✅ Ваша запись на *{ev['title']}* подтверждена!\n🎭 Роль: {role_name}\n\n"
+                                         f"Ожидайте. Будьте на паре — руководитель медиацентра придёт и отпросит вас с занятия.",
+                                    parse_mode="Markdown"
+                                )
+                            except Exception:
+                                pass
+                            return
+
+async def remove_signup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, ev_id, role_name, tg_id = query.data.split("_", 3)
+    ev_id, tg_id = int(ev_id), int(tg_id)
+    ctx.user_data["remove_ev_id"] = ev_id
+    ctx.user_data["remove_role"] = role_name
+    ctx.user_data["remove_tg_id"] = tg_id
+    await query.message.reply_text(
+        "✏️ Напишите комментарий для активиста (или напишите `-` чтобы не добавлять):"
+    )
+    return WAIT_REMOVE_COMMENT
+
+async def got_remove_comment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    comment = update.message.text.strip()
+    ev_id = ctx.user_data["remove_ev_id"]
+    role_name = ctx.user_data["remove_role"]
+    tg_id = ctx.user_data["remove_tg_id"]
+    data = load_data()
+    for ev in data["events"]:
+        if ev["id"] == ev_id:
+            for r in ev["roles"]:
+                if r["name"] == role_name:
+                    removed = [s for s in r["signups"] if s["telegram_id"] == tg_id]
+                    r["signups"] = [s for s in r["signups"] if s["telegram_id"] != tg_id]
+                    save_data(data)
+                    await update.message.reply_text("🗑 Запись удалена. Место освободилось.")
+                    if removed:
+                        comment_text = f"\n\n💬 Комментарий: {comment}" if comment != "-" else ""
+                        try:
+                            await update.get_bot().send_message(
+                                chat_id=tg_id,
+                                text=f"❌ Ваша запись на *{ev['title']}* (роль: {role_name}) отменена.{comment_text}",
+                                parse_mode="Markdown"
+                            )
+                        except Exception:
+                            pass
+                    ctx.user_data.clear()
+                    return ConversationHandler.END
+    await update.message.reply_text("Запись не найдена.")
+    return ConversationHandler.END
+
+async def admin_close_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ev_id = int(query.data.split("_")[-1])
+    data = load_data()
+    for ev in data["events"]:
+        if ev["id"] == ev_id:
+            ev["active"] = False
+    save_data(data)
+    await query.message.reply_text("✅ Мероприятие закрыто.")
+
+# ── Добавить/удалить активиста ────────────────────────────────────────────────
 async def admin_add_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -225,56 +427,29 @@ async def got_member_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     return ConversationHandler.END
 
-
-# ── Список активистов ─────────────────────────────────────────────────────────
 async def admin_members(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = load_data()
     if not data["members"]:
-        await query.message.reply_text("Список активистов пуст.")
+        await query.message.reply_text("Список пуст.")
         return
-    text = "👥 *Список активистов:*\n\n"
-    for i, m in enumerate(data["members"], 1):
-        text += f"{i}. {m['name']} — {m['group']}\n"
-    await query.message.reply_text(text, parse_mode="Markdown")
+    text = "👥 *Активисты:*\n\n"
+    kb = []
+    for i, m in enumerate(data["members"]):
+        text += f"{i+1}. {m['name']} — {m['group']}\n"
+        kb.append([InlineKeyboardButton(f"❌ {m['name'].split()[0]}", callback_data=f"del_member_{i}")])
+    await query.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
-
-# ── Список мероприятий ────────────────────────────────────────────────────────
-async def admin_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def del_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    idx = int(query.data.split("_")[-1])
     data = load_data()
-    events = [e for e in data["events"] if e.get("active")]
-    if not events:
-        await query.message.reply_text("Нет активных мероприятий.")
-        return
-    for ev in events:
-        total_spots = sum(r["total"] for r in ev["roles"])
-        total_signed = sum(len(r["signups"]) for r in ev["roles"])
-        roles_text = ""
-        for r in ev["roles"]:
-            names = ", ".join(s["fio"] for s in r["signups"]) or "—"
-            roles_text += f"\n  *{r['name']}* ({len(r['signups'])}/{r['total']}): {names}"
-        kb = [[InlineKeyboardButton("🗑 Закрыть мероприятие", callback_data=f"admin_close_{ev['id']}")]]
-        await query.message.reply_text(
-            f"📌 *{ev['title']}*\n📅 {ev['date']}\n📍 {ev['location']}\n"
-            f"👥 Записалось: {total_signed}/{total_spots}{roles_text}",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)
-        )
-
-async def admin_close_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    event_id = int(query.data.split("_")[-1])
-    data = load_data()
-    for ev in data["events"]:
-        if ev["id"] == event_id:
-            ev["active"] = False
-            break
-    save_data(data)
-    await query.message.reply_text("✅ Мероприятие закрыто.")
-
+    if 0 <= idx < len(data["members"]):
+        removed = data["members"].pop(idx)
+        save_data(data)
+        await query.message.reply_text(f"🗑 *{removed['name']}* удалён.", parse_mode="Markdown")
 
 # ── Выгрузка CSV ──────────────────────────────────────────────────────────────
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -282,29 +457,29 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = load_data()
     output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Мероприятие", "Дата", "Место", "Роль", "Мест всего", "ФИО", "Группа", "Telegram", "Время записи"])
+    w = csv.writer(output)
+    w.writerow(["Мероприятие","Дата","Место","Роль","Мест всего","ФИО","Группа","Telegram","Время","Статус"])
     for ev in data["events"]:
         for role in ev["roles"]:
             for s in role["signups"]:
-                writer.writerow([ev["title"], ev["date"], ev["location"], role["name"], role["total"],
-                                  s["fio"], s["group"], s.get("username", "—"), s["signed_at"]])
+                w.writerow([ev["title"], ev["date"], ev["location"], role["name"], role["total"],
+                            s["fio"], s["group"], s.get("username","—"), s["signed_at"],
+                            "Подтверждён" if s.get("approved") else "Ожидает"])
             if not role["signups"]:
-                writer.writerow([ev["title"], ev["date"], ev["location"], role["name"], role["total"], "", "", "", ""])
+                w.writerow([ev["title"], ev["date"], ev["location"], role["name"], role["total"],"","","","",""])
     output.seek(0)
     bio = io.BytesIO(output.getvalue().encode("utf-8-sig"))
     bio.name = "activists.csv"
-    await query.message.reply_document(document=bio, filename="activists.csv", caption="📥 Выгрузка записей")
+    await query.message.reply_document(document=bio, filename="activists.csv", caption="📥 Выгрузка")
 
-
-# ── Запись активиста ──────────────────────────────────────────────────────────
+# ── Запись на мероприятие ─────────────────────────────────────────────────────
 async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = load_data()
     events = [e for e in data["events"] if e.get("active")]
     if not events:
-        await query.message.reply_text("😔 Сейчас нет открытых мероприятий. Загляните позже!")
+        await query.message.reply_text("😔 Сейчас нет открытых мероприятий.")
         return ConversationHandler.END
     kb = [[InlineKeyboardButton(f"📌 {ev['title']} — {ev['date']}", callback_data=f"ev_{ev['id']}")] for ev in events]
     await query.message.reply_text("Выберите мероприятие:", reply_markup=InlineKeyboardMarkup(kb))
@@ -313,13 +488,18 @@ async def signup_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def choose_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    event_id = int(query.data.split("_")[1])
+    ev_id = int(query.data.split("_")[1])
+    user = update.effective_user
     data = load_data()
-    ev = next((e for e in data["events"] if e["id"] == event_id), None)
+    ev = next((e for e in data["events"] if e["id"] == ev_id), None)
     if not ev:
         await query.message.reply_text("Мероприятие не найдено.")
         return ConversationHandler.END
-    ctx.user_data["event_id"] = event_id
+    # Проверка: уже записан на это мероприятие?
+    if is_already_signed_to_event(ev, user.id):
+        await query.message.reply_text("Вы уже записаны на это мероприятие!")
+        return ConversationHandler.END
+    ctx.user_data["event_id"] = ev_id
     available = [r for r in ev["roles"] if len(r["signups"]) < r["total"]]
     if not available:
         await query.message.reply_text("😔 Все места заняты!")
@@ -335,74 +515,48 @@ async def choose_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     role_name = query.data[len("role_"):]
-    ctx.user_data["role"] = role_name
-    desc = ROLE_DESCRIPTIONS.get(role_name, f"🎭 *{role_name}*")
-    await query.message.reply_text(desc, parse_mode="Markdown")
-    await query.message.reply_text("✏️ Введите ваше ФИО (Фамилия Имя или Фамилия Имя Отчество):")
-    return WAIT_FIO
-
-async def got_fio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    fio = update.message.text.strip()
-    ctx.user_data["fio"] = fio
-    data = load_data()
-    if not find_member(data, fio):
-        for admin_id in ADMIN_IDS:
-            try:
-                await update.get_bot().send_message(
-                    chat_id=admin_id,
-                    text=f"⚠️ Активист *{fio}* не найден в списке, но пытается записаться.",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-    await update.message.reply_text("🎓 Введите вашу группу:")
-    return WAIT_GROUP
-
-async def got_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    group = update.message.text.strip()
     user = update.effective_user
     data = load_data()
-    event_id = ctx.user_data["event_id"]
-    role_name = ctx.user_data["role"]
-    fio = ctx.user_data["fio"]
-    ev = next((e for e in data["events"] if e["id"] == event_id), None)
-    if not ev:
-        await update.message.reply_text("❌ Мероприятие не найдено.")
-        return ConversationHandler.END
+    reg = get_user_reg(data, user.id)
+    ev_id = ctx.user_data["event_id"]
+    ev = next((e for e in data["events"] if e["id"] == ev_id), None)
     role = next((r for r in ev["roles"] if r["name"] == role_name), None)
-    if not role:
-        await update.message.reply_text("❌ Роль не найдена.")
-        return ConversationHandler.END
     if len(role["signups"]) >= role["total"]:
-        await update.message.reply_text("😔 Место уже занято. Попробуйте другую роль — /start")
-        return ConversationHandler.END
-    if any(s.get("telegram_id") == user.id for s in role["signups"]):
-        await update.message.reply_text("Вы уже записаны на эту роль!")
-        return ConversationHandler.END
+        await query.message.reply_text("😔 Место уже занято. Выберите другую роль.")
+        return CHOOSE_ROLE
+    desc = ROLE_DESCRIPTIONS.get(role_name, f"🎭 *{role_name}*")
+    await query.message.reply_text(desc, parse_mode="Markdown")
     role["signups"].append({
         "telegram_id": user.id,
         "username": f"@{user.username}" if user.username else "—",
-        "fio": fio,
-        "group": group,
-        "signed_at": datetime.now().strftime("%d.%m.%Y %H:%M")
+        "fio": reg["fio"],
+        "group": reg["group"],
+        "signed_at": datetime.now().strftime("%d.%m.%Y %H:%M"),
+        "approved": False
     })
     save_data(data)
-
-    cert_link = data.get("cert_link", "")
-    cert_text = (
-        f"\n\n📄 Справка-подтверждение об участии будет доступна по ссылке:\n{cert_link}"
-        if cert_link else
-        "\n\n📄 Справка-подтверждение будет доступна после мероприятия."
-    )
-
-    await update.message.reply_text(
-        f"✅ *Вы записаны!*\n\n"
-        f"📌 {ev['title']}\n"
-        f"📅 {ev['date']}\n"
-        f"📍 {ev['location']}\n"
-        f"🎭 Роль: *{role_name}*\n"
-        f"👤 {fio}, {group}\n\n"
-        f"⏳ Ожидайте. Будьте на паре — руководитель медиацентра придёт и отпросит вас с занятия."
+    # Уведомить организатора
+    for admin_id in ADMIN_IDS:
+        try:
+            kb = [[
+                InlineKeyboardButton("✅ Принять", callback_data=f"approve_{ev_id}_{role_name}_{user.id}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"remove_{ev_id}_{role_name}_{user.id}"),
+            ]]
+            await query.get_bot().send_message(
+                chat_id=admin_id,
+                text=f"🔔 Новая запись!\n\n*{reg['fio']}* ({reg['group']})\n📌 {ev['title']}\n🎭 {role_name}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+        except Exception:
+            pass
+    cert = data.get("cert_link", "")
+    cert_text = f"\n\n📄 Справка-подтверждение: {cert}" if cert else "\n\n📄 Справка будет доступна после мероприятия."
+    await query.message.reply_text(
+        f"⏳ *Заявка отправлена!*\n\n"
+        f"📌 {ev['title']}\n📅 {ev['date']}\n📍 {ev['location']}\n🎭 Роль: *{role_name}*\n\n"
+        f"Ожидайте подтверждения от руководителя.\n"
+        f"Будьте на паре — руководитель медиацентра придёт и отпросит вас с занятия."
         f"{cert_text}",
         parse_mode="Markdown"
     )
@@ -410,14 +564,59 @@ async def got_group(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено. Нажмите /start чтобы начать заново.")
+    await update.message.reply_text("Отменено. /start — начать заново.")
     ctx.user_data.clear()
     return ConversationHandler.END
 
+# ── Напоминания ───────────────────────────────────────────────────────────────
+async def send_reminders(app):
+    while True:
+        await asyncio.sleep(300)
+        try:
+            data = load_data()
+            now = datetime.now()
+            changed = False
+            for ev in data["events"]:
+                if not ev.get("active"):
+                    continue
+                dt = parse_event_datetime(ev["date"])
+                if not dt:
+                    continue
+                diff = (dt - now).total_seconds() / 3600
+                sent = ev.get("reminders_sent", [])
+                for threshold, label in [(12, "12h"), (1, "1h")]:
+                    if label not in sent and 0 < diff <= threshold + 0.08:
+                        hours_text = "12 часов" if threshold == 12 else "1 час"
+                        # Уведомляем только подтверждённых
+                        for r in ev["roles"]:
+                            for s in r["signups"]:
+                                if not s.get("approved"):
+                                    continue
+                                try:
+                                    await app.bot.send_message(
+                                        chat_id=s["telegram_id"],
+                                        text=f"⏰ Напоминание! До мероприятия *{ev['title']}* осталось {hours_text}.\n📅 {ev['date']}\n📍 {ev['location']}",
+                                        parse_mode="Markdown"
+                                    )
+                                except Exception:
+                                    pass
+                        sent.append(label)
+                        changed = True
+                ev["reminders_sent"] = sent
+            if changed:
+                save_data(data)
+        except Exception:
+            pass
 
+# ── Запуск ────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
+    reg_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={WAIT_REG_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_reg_fio)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     cert_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_cert_link, pattern="^admin_cert_link$")],
         states={WAIT_CERT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_cert_link)]},
@@ -444,27 +643,38 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+    remove_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(remove_signup, pattern="^remove_")],
+        states={WAIT_REMOVE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_remove_comment)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
     signup_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(signup_start, pattern="^signup_start$")],
         states={
             CHOOSE_EVENT: [CallbackQueryHandler(choose_event, pattern="^ev_")],
             CHOOSE_ROLE:  [CallbackQueryHandler(choose_role, pattern="^role_")],
-            WAIT_FIO:     [MessageHandler(filters.TEXT & ~filters.COMMAND, got_fio)],
-            WAIT_GROUP:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_group)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(reg_conv)
     app.add_handler(cert_conv)
     app.add_handler(add_conv)
     app.add_handler(member_conv)
+    app.add_handler(remove_conv)
     app.add_handler(signup_conv)
-    app.add_handler(CallbackQueryHandler(admin_list, pattern="^admin_list$"))
-    app.add_handler(CallbackQueryHandler(admin_members, pattern="^admin_members$"))
-    app.add_handler(CallbackQueryHandler(admin_export, pattern="^admin_export$"))
+    app.add_handler(CallbackQueryHandler(admin_list,        pattern="^admin_list$"))
+    app.add_handler(CallbackQueryHandler(admin_members,     pattern="^admin_members$"))
+    app.add_handler(CallbackQueryHandler(admin_export,      pattern="^admin_export$"))
     app.add_handler(CallbackQueryHandler(admin_close_event, pattern="^admin_close_"))
+    app.add_handler(CallbackQueryHandler(approve_signup,    pattern="^approve_"))
+    app.add_handler(CallbackQueryHandler(del_member,        pattern="^del_member_"))
+    app.add_handler(CallbackQueryHandler(get_cert,          pattern="^get_cert$"))
 
+    async def post_init(application):
+        asyncio.create_task(send_reminders(application))
+
+    app.post_init = post_init
     print("Бот запущен...")
     app.run_polling()
 
