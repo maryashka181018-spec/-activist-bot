@@ -10,8 +10,8 @@ from telegram.ext import (
 )
 
 # ── Настройки ────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS").split(",")))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 DATA_FILE = "data.json"
 
 # ── Состояния диалога ─────────────────────────────────────────────────────────
@@ -47,6 +47,17 @@ def next_event_id(data):
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+
+# ── /myid ─────────────────────────────────────────────────────────────────────
+async def myid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Ваш Telegram ID: `{user.id}`\n"
+        f"Имя: {user.first_name}\n"
+        f"Username: @{user.username or '—'}\n\n"
+        f"Вставьте этот ID в переменную ADMIN_IDS на Railway.",
+        parse_mode="Markdown"
+    )
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -377,6 +388,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(add_conv)
     app.add_handler(signup_conv)
     app.add_handler(CallbackQueryHandler(admin_list, pattern="^admin_list$"))
