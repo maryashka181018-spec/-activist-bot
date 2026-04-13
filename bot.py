@@ -142,13 +142,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     data = load_data()
-    reg = get_user_reg(data, user.id)
-    if reg:
-        await show_main_menu(update.message, reg["fio"])
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown")
-        return WAIT_REG_FIO
+    # Каждый /start — удаляем из known_users, чтобы пройти регистрацию заново
+    # Это нужно если активист очистил чат или был удалён из базы
+    if str(user.id) in data["known_users"]:
+        del data["known_users"][str(user.id)]
+        save_data(data)
+    await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown")
+    return WAIT_REG_FIO
 
 async def show_main_menu(message, fio):
     kb = [
@@ -448,8 +448,12 @@ async def del_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     if 0 <= idx < len(data["members"]):
         removed = data["members"].pop(idx)
+        # Удаляем из known_users — при следующем /start пройдёт регистрацию заново и получит отказ
+        to_delete = [uid for uid, u in data["known_users"].items() if fio_match(u["fio"], removed["name"])]
+        for uid in to_delete:
+            del data["known_users"][uid]
         save_data(data)
-        await query.message.reply_text(f"🗑 *{removed['name']}* удалён.", parse_mode="Markdown")
+        await query.message.reply_text(f"🗑 *{removed['name']}* удалён из базы активистов.", parse_mode="Markdown")
 
 # ── Выгрузка CSV ──────────────────────────────────────────────────────────────
 async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -672,6 +676,10 @@ def main():
     app.add_handler(CallbackQueryHandler(get_cert,          pattern="^get_cert$"))
 
     async def post_init(application):
+        from telegram import BotCommand
+        await application.bot.set_my_commands([
+            BotCommand("start", "Открыть меню"),
+        ])
         asyncio.create_task(send_reminders(application))
 
     app.post_init = post_init
