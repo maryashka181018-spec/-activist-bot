@@ -274,15 +274,24 @@ async def done_roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ Мероприятие добавлено!\n\n*{event['title']}*\n📅 {event['date']}\n📍 {event['location']}\n{roles_text}",
         parse_mode="Markdown"
     )
-    for uid_str in data.get("known_users", {}):
-        try:
-            await update.get_bot().send_message(
-                chat_id=int(uid_str),
-                text=f"🆕 Новое мероприятие!\n\n*{event['title']}*\n📅 {event['date']}\n📍 {event['location']}\n\nЗапишись через /start",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
+
+    async def _notify_all():
+        bot = update.get_bot()
+        notify_text = (
+            f"🆕 Новое мероприятие!\n\n*{event['title']}*\n"
+            f"📅 {event['date']}\n📍 {event['location']}\n\nЗапишись через /start"
+        )
+        for uid_str in data.get("known_users", {}):
+            try:
+                await bot.send_message(
+                    chat_id=int(uid_str),
+                    text=notify_text,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_notify_all())
     ctx.user_data.clear()
     return ConversationHandler.END
 
@@ -298,27 +307,36 @@ async def admin_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for ev in events:
         total = sum(r["total"] for r in ev["roles"])
         signed = sum(len(r["signups"]) for r in ev["roles"])
+        # Собираем состав ролей в одно сообщение
+        roles_lines = []
+        for r in ev["roles"]:
+            if not r["signups"]:
+                roles_lines.append(f"🎭 *{r['name']}* — никто не записался")
+            else:
+                for s in r["signups"]:
+                    status = "✅" if s.get("approved") else "⏳"
+                    roles_lines.append(f"{status} *{r['name']}*: {s['fio']} — {s['group']}")
+        roles_text = "\n".join(roles_lines)
         await query.message.reply_text(
-            f"📌 *{ev['title']}*\n📅 {ev['date']}\n📍 {ev['location']}\n👥 {signed}/{total}",
+            f"📌 *{ev['title']}*\n📅 {ev['date']}\n📍 {ev['location']}\n👥 {signed}/{total}\n\n{roles_text}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🗑 Закрыть мероприятие", callback_data=f"admin_close_{ev['id']}")
             ]])
         )
+        # Кнопки управления записями — отдельное сообщение только если есть записи
+        action_rows = []
         for r in ev["roles"]:
-            if not r["signups"]:
-                await query.message.reply_text(f"🎭 *{r['name']}* — никто не записался", parse_mode="Markdown")
-                continue
             for s in r["signups"]:
-                status = "✅" if s.get("approved") else "⏳"
-                kb = [[InlineKeyboardButton("❌ Удалить", callback_data=f"remove_{ev['id']}_{r['name']}_{s['telegram_id']}")]]
+                row = [InlineKeyboardButton("❌ Удалить", callback_data=f"remove_{ev['id']}_{r['name']}_{s['telegram_id']}")]
                 if not s.get("approved"):
-                    kb[0].insert(0, InlineKeyboardButton("✅ Принять", callback_data=f"approve_{ev['id']}_{r['name']}_{s['telegram_id']}"))
-                await query.message.reply_text(
-                    f"{status} *{r['name']}*: {s['fio']} — {s['group']}",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(kb)
-                )
+                    row.insert(0, InlineKeyboardButton("✅ Принять", callback_data=f"approve_{ev['id']}_{r['name']}_{s['telegram_id']}"))
+                action_rows.append(row)
+        if action_rows:
+            await query.message.reply_text(
+                "⚙️ Управление записями:",
+                reply_markup=InlineKeyboardMarkup(action_rows)
+            )
 
 async def approve_signup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -499,15 +517,18 @@ async def choose_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ev:
         await query.message.reply_text("Мероприятие не найдено.")
         return ConversationHandler.END
-    # Проверка: уже записан на это мероприятие?
     if is_already_signed_to_event(ev, user.id):
         await query.message.reply_text("Вы уже записаны на это мероприятие!")
         return ConversationHandler.END
-    ctx.user_data["event_id"] = ev_id
     available = [r for r in ev["roles"] if len(r["signups"]) < r["total"]]
     if not available:
         await query.message.reply_text("😔 Все места заняты!")
         return ConversationHandler.END
+    # Кэшируем данные пользователя, чтобы не перечитывать файл в choose_role
+    reg = get_user_reg(data, user.id)
+    ctx.user_data["event_id"] = ev_id
+    ctx.user_data["reg"] = reg
+    ctx.user_data["cert_link"] = data.get("cert_link", "")
     kb = [[InlineKeyboardButton(f"{r['name']} ({len(r['signups'])}/{r['total']})", callback_data=f"role_{r['name']}")] for r in available]
     await query.message.reply_text(
         f"*{ev['title']}*\n📅 {ev['date']}\n📍 {ev['location']}\n\nВыберите роль:",
@@ -520,16 +541,16 @@ async def choose_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     role_name = query.data[len("role_"):]
     user = update.effective_user
-    data = load_data()
-    reg = get_user_reg(data, user.id)
     ev_id = ctx.user_data["event_id"]
+    reg = ctx.user_data["reg"]
+    cert = ctx.user_data.get("cert_link", "")
+    # Единственное чтение файла — для актуальной проверки мест и записи
+    data = load_data()
     ev = next((e for e in data["events"] if e["id"] == ev_id), None)
     role = next((r for r in ev["roles"] if r["name"] == role_name), None)
     if len(role["signups"]) >= role["total"]:
         await query.message.reply_text("😔 Место уже занято. Выберите другую роль.")
         return CHOOSE_ROLE
-    desc = ROLE_DESCRIPTIONS.get(role_name, f"🎭 *{role_name}*")
-    await query.message.reply_text(desc, parse_mode="Markdown")
     role["signups"].append({
         "telegram_id": user.id,
         "username": f"@{user.username}" if user.username else "—",
@@ -539,22 +560,27 @@ async def choose_role(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "approved": False
     })
     save_data(data)
-    # Уведомить организатора
-    for admin_id in ADMIN_IDS:
-        try:
-            kb = [[
-                InlineKeyboardButton("✅ Принять", callback_data=f"approve_{ev_id}_{role_name}_{user.id}"),
-                InlineKeyboardButton("❌ Отклонить", callback_data=f"remove_{ev_id}_{role_name}_{user.id}"),
-            ]]
-            await query.get_bot().send_message(
-                chat_id=admin_id,
-                text=f"🔔 Новая запись!\n\n*{reg['fio']}* ({reg['group']})\n📌 {ev['title']}\n🎭 {role_name}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-        except Exception:
-            pass
-    cert = data.get("cert_link", "")
+    desc = ROLE_DESCRIPTIONS.get(role_name, f"🎭 *{role_name}*")
+    await query.message.reply_text(desc, parse_mode="Markdown")
+    # Уведомить организаторов асинхронно в фоне
+    async def _notify_admins():
+        bot = query.get_bot()
+        admin_kb = [[
+            InlineKeyboardButton("✅ Принять", callback_data=f"approve_{ev_id}_{role_name}_{user.id}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"remove_{ev_id}_{role_name}_{user.id}"),
+        ]]
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=f"🔔 Новая запись!\n\n*{reg['fio']}* ({reg['group']})\n📌 {ev['title']}\n🎭 {role_name}",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(admin_kb)
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_notify_admins())
     cert_text = f"\n\n📄 Справка-подтверждение: {cert}" if cert else "\n\n📄 Справка будет доступна после мероприятия."
     await query.message.reply_text(
         f"⏳ *Заявка отправлена!*\n\n"
