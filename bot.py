@@ -11,7 +11,7 @@ from telegram.ext import (
 
 # ── Настройки ────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8373024398:AAG9rKnyhgPYfsccuqu_K9oHXHa7iqki1Ow")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "8229166828").split(",")))  # ваш Telegram ID
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "8229166828").split(",")))
 DATA_FILE = "data.json"
 
 # ── Состояния диалога ─────────────────────────────────────────────────────────
