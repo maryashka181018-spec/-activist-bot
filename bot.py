@@ -462,15 +462,42 @@ async def admin_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     output = io.StringIO()
     w = csv.writer(output)
-    w.writerow(["Мероприятие","Дата","Место","Роль","Мест всего","ФИО","Группа","Telegram","Время","Статус"])
+    w.writerow([
+        "Мероприятие", "Дата мероприятия", "Место",
+        "Роль", "Мест всего", "Занято мест",
+        "Фамилия", "Имя", "Отчество",
+        "Группа", "Ник в Telegram",
+        "Дата записи", "Время записи", "Статус"
+    ])
     for ev in data["events"]:
         for role in ev["roles"]:
-            for s in role["signups"]:
-                w.writerow([ev["title"], ev["date"], ev["location"], role["name"], role["total"],
-                            s["fio"], s["group"], s.get("username","—"), s["signed_at"],
-                            "Подтверждён" if s.get("approved") else "Ожидает"])
-            if not role["signups"]:
-                w.writerow([ev["title"], ev["date"], ev["location"], role["name"], role["total"],"","","","",""])
+            if role["signups"]:
+                for s in role["signups"]:
+                    # Разбиваем ФИО на части
+                    fio_parts = s["fio"].split()
+                    surname   = fio_parts[0] if len(fio_parts) > 0 else ""
+                    first     = fio_parts[1] if len(fio_parts) > 1 else ""
+                    patronym  = fio_parts[2] if len(fio_parts) > 2 else ""
+                    # Разбиваем дату/время записи
+                    signed_at = s.get("signed_at", "")
+                    if " " in signed_at:
+                        date_part, time_part = signed_at.split(" ", 1)
+                    else:
+                        date_part, time_part = signed_at, ""
+                    w.writerow([
+                        ev["title"], ev["date"], ev["location"],
+                        role["name"], role["total"], len(role["signups"]),
+                        surname, first, patronym,
+                        s["group"], s.get("username", "—"),
+                        date_part, time_part,
+                        "Подтверждён" if s.get("approved") else "Ожидает"
+                    ])
+            else:
+                w.writerow([
+                    ev["title"], ev["date"], ev["location"],
+                    role["name"], role["total"], 0,
+                    "", "", "", "", "", "", "", ""
+                ])
     output.seek(0)
     bio = io.BytesIO(output.getvalue().encode("utf-8-sig"))
     bio.name = "activists.csv"
