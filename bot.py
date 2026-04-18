@@ -1,4 +1,4 @@
-import os, json, csv, io, asyncio
+import os, json, csv, io, asyncio, subprocess, tempfile
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -134,6 +134,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("➕ Добавить активиста",      callback_data="admin_add_member")],
             [InlineKeyboardButton("🔗 Ссылка на справку",       callback_data="admin_cert_link")],
             [InlineKeyboardButton("📥 Выгрузить CSV",           callback_data="admin_export")],
+            [InlineKeyboardButton("📄 Справка-подтверждение",   callback_data="admin_spravka")],
         ]
         await update.message.reply_text(
             f"👋 Привет, {user.first_name}! Режим организатора.\n🔗 Справка: {cert}",
@@ -603,7 +604,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Напоминания ───────────────────────────────────────────────────────────────
 async def send_reminders(app):
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)  # проверяем каждую минуту
         try:
             data = load_data()
             now = datetime.now()
@@ -614,12 +615,19 @@ async def send_reminders(app):
                 dt = parse_event_datetime(ev["date"])
                 if not dt:
                     continue
-                diff = (dt - now).total_seconds() / 3600
+                diff_seconds = (dt - now).total_seconds()
+                diff_hours = diff_seconds / 3600
                 sent = ev.get("reminders_sent", [])
-                for threshold, label in [(12, "12h"), (1, "1h")]:
-                    if label not in sent and 0 < diff <= threshold + 0.08:
-                        hours_text = "12 часов" if threshold == 12 else "1 час"
-                        # Уведомляем только подтверждённых
+
+                # За 24 часа, за 2 часа, за 30 минут — не надоедает, но не забудешь
+                reminders = [
+                    (24 * 3600, "24h", "сутки — готовься!",   "🗓"),
+                    (2  * 3600, "2h",  "2 часа — будь на старте!", "⏰"),
+                    (30 * 60,   "30m", "30 минут — ты же не забыл?", "🔔"),
+                ]
+
+                for window, label, text, icon in reminders:
+                    if label not in sent and window >= diff_seconds > window - 300:
                         for r in ev["roles"]:
                             for s in r["signups"]:
                                 if not s.get("approved"):
@@ -627,18 +635,77 @@ async def send_reminders(app):
                                 try:
                                     await app.bot.send_message(
                                         chat_id=s["telegram_id"],
-                                        text=f"⏰ Напоминание! До мероприятия *{ev['title']}* осталось {hours_text}.\n📅 {ev['date']}\n📍 {ev['location']}",
+                                        text=(
+                                            f"{icon} *Напоминание!*\n\n"
+                                            f"До мероприятия *{ev['title']}* осталось *{text}*.\n\n"
+                                            f"📅 {ev['date']}\n"
+                                            f"📍 {ev['location']}\n\n"
+                                            f"Не опаздывай! 💪"
+                                        ),
                                         parse_mode="Markdown"
                                     )
                                 except Exception:
                                     pass
                         sent.append(label)
                         changed = True
+
                 ev["reminders_sent"] = sent
             if changed:
                 save_data(data)
         except Exception:
             pass
+
+
+# ── Генерация справки-подтверждения ──────────────────────────────────────────
+def generate_spravka(events_data):
+    """Генерирует .docx справку по мероприятиям. events_data — список dicts с title,date,location,students"""
+    script_path = os.path.join(os.path.dirname(__file__), "gen_spravka.js")
+    out_path = tempfile.mktemp(suffix=".docx")
+    payload = json.dumps({"events": events_data})
+    result = subprocess.run(
+        ["node", script_path, payload, out_path],
+        capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError(f"Ошибка генерации: {result.stderr}")
+    with open(out_path, "rb") as f:
+        data = f.read()
+    os.remove(out_path)
+    return data
+
+async def admin_export_spravka(update, ctx):
+    query = update.callback_query
+    await query.answer()
+    data = load_data()
+    events_data = []
+    for ev in data["events"]:
+        students = []
+        for role in ev["roles"]:
+            for s in role["signups"]:
+                line = f"{s['fio']} {s['group']}"
+                if line not in students:
+                    students.append(line)
+        if students:
+            events_data.append({
+                "title": ev["title"],
+                "date": ev["date"],
+                "location": ev["location"],
+                "students": students
+            })
+    if not events_data:
+        await query.message.reply_text("Нет записей для справки.")
+        return
+    try:
+        docx_bytes = generate_spravka(events_data)
+        bio = io.BytesIO(docx_bytes)
+        bio.name = "spravka.docx"
+        await query.message.reply_document(
+            document=bio,
+            filename="СПРАВКА_ПОДТВЕРЖДЕНИЕ.docx",
+            caption="📄 Справка-подтверждение сформирована"
+        )
+    except Exception as e:
+        await query.message.reply_text(f"❌ Ошибка: {e}")
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
 def main():
@@ -702,6 +769,7 @@ def main():
     app.add_handler(CallbackQueryHandler(approve_signup,    pattern="^approve_"))
     app.add_handler(CallbackQueryHandler(del_member,        pattern="^del_member_"))
     app.add_handler(CallbackQueryHandler(get_cert,          pattern="^get_cert$"))
+    app.add_handler(CallbackQueryHandler(admin_export_spravka, pattern="^admin_spravka$"))
 
     async def post_init(application):
         from telegram import BotCommand
