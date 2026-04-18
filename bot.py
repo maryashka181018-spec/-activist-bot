@@ -17,8 +17,8 @@ DATA_FILE  = "data.json"
     WAIT_REG_FIO, WAIT_MEMBER_NAME, WAIT_MEMBER_GROUP,
     WAIT_CERT_LINK, WAIT_GROUP_LINK,
     CHOOSE_EVENT, CHOOSE_ROLE,
-    WAIT_REMOVE_COMMENT,
-) = range(12)
+    WAIT_REMOVE_COMMENT, WAIT_EXCEL,
+) = range(13)
 
 ROLE_DESCRIPTIONS = {
     "Фотограф": (
@@ -408,8 +408,73 @@ async def admin_close_event(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def admin_add_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    kb = [
+        [InlineKeyboardButton("👤 Добавить одного", callback_data="member_one")],
+        [InlineKeyboardButton("📊 Загрузить Excel-файл", callback_data="member_excel")],
+    ]
+    await query.message.reply_text(
+        "Как добавить активистов?",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    return WAIT_MEMBER_NAME
+
+async def member_one(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     await query.message.reply_text("👤 Введите ФИО активиста:")
     return WAIT_MEMBER_NAME
+
+async def member_excel_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "📊 Отправьте Excel-файл (.xlsx или .xls)\n\n"
+        "Формат файла — два столбца:\n"
+        "*Столбец A:* ФИО\n"
+        "*Столбец B:* Группа\n\n"
+        "Первая строка может быть заголовком — пропустим автоматически.",
+        parse_mode="Markdown"
+    )
+    return WAIT_EXCEL
+
+async def got_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc or not (doc.file_name.endswith(".xlsx") or doc.file_name.endswith(".xls")):
+        await update.message.reply_text("❌ Нужен файл .xlsx или .xls")
+        return WAIT_EXCEL
+    try:
+        import openpyxl, tempfile
+        file = await doc.get_file()
+        tmp = tempfile.mktemp(suffix=".xlsx")
+        await file.download_to_drive(tmp)
+        wb = openpyxl.load_workbook(tmp)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        # Пропускаем заголовок если первая строка не похожа на данные
+        start = 0
+        if rows and rows[0][0] and str(rows[0][0]).lower() in ("фио", "имя", "name", "ф.и.о"):
+            start = 1
+        data = load_data()
+        added, skipped = [], []
+        for row in rows[start:]:
+            if not row[0]:
+                continue
+            name = str(row[0]).strip()
+            group = str(row[1]).strip() if row[1] else ""
+            if find_member(data, name):
+                skipped.append(name)
+            else:
+                data["members"].append({"name": name, "group": group})
+                added.append(name)
+        save_data(data)
+        import os; os.remove(tmp)
+        text = f"✅ Добавлено: *{len(added)}* активистов"
+        if skipped:
+            text += f"\n⚠️ Уже были в списке: {len(skipped)}"
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при чтении файла: {e}")
+    return ConversationHandler.END
 
 async def got_member_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["member_name"] = update.message.text.strip()
@@ -658,62 +723,12 @@ async def send_reminders(app):
 
 # ── Генерация справки-подтверждения ──────────────────────────────────────────
 def generate_spravka(events_data):
-    """Генерирует .docx справку на чистом Python через python-docx"""
-    from docx import Document
-    from docx.shared import Pt, Cm
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    doc = Document()
-
-    # Поля страницы
-    section = doc.sections[0]
-    section.top_margin    = Cm(2)
-    section.bottom_margin = Cm(2)
-    section.left_margin   = Cm(3)
-    section.right_margin  = Cm(1.5)
-
-    def add(text, bold=False, align=WD_ALIGN_PARAGRAPH.LEFT, size=12, center=False):
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER if center else align
-        run = p.add_run(text)
-        run.bold = bold
-        run.font.name = "Times New Roman"
-        run.font.size = Pt(size)
-        return p
-
-    for i, ev in enumerate(events_data):
-        if i > 0:
-            doc.add_page_break()
-
-        add("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ", bold=True, center=True)
-        add("РЕСПУБЛИКИ ДАГЕСТАН", bold=True, center=True)
-        add("ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ПРОФЕССИОНАЛЬНОЕ ОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ РЕСПУБЛИКИ ДАГЕСТАН", bold=True, center=True)
-        add("«ТЕХНИЧЕСКИЙ КОЛЛЕДЖ ИМЕНИ Р.Н. АШУРАЛИЕВА»", bold=True, center=True)
-        add("(ГБПОУ РД «ТК им. Р.Н. Ашуралиева»)", center=True)
-        add("")
-        add("367013, г. Махачкала, Студенческий переулок, 3, тел.: (8722)68-16-04, e-mail: rpk-05@mail.ru,  http://www.therpk.ru", center=True, size=10)
-        add("")
-        add("СПРАВКА-ПОДТВЕРЖДЕНИЕ", bold=True, center=True)
-        add("")
-        add(f"В рамках мероприятия медиа-направления «Профессионалитет», проведенного {ev['date']} в {ev['location']} обучающиеся:")
-        for student in ev["students"]:
-            add(student)
-        add("в указанный период отсутствовали на учебных занятиях по уважительной причине в связи с участием в мероприятии.")
-        add("")
-        add("Справка выдана для предоставления кураторам и преподавателям.")
-        add("")
-        add("")
-        add("Директор                                                                       Рахманова М.М.")
-        add("")
-        add("")
-        add("")
-        add("Исполнитель: Магомедова М.Д.")
-        add("8-928-055-90-38")
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.read()
+    """Генерирует справку на основе оригинального шаблона — сохраняет дизайн, картинку и форматирование"""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from gen_spravka import generate_spravka as _gen
+    template = os.path.join(os.path.dirname(__file__), "СПРАВКА_ПОДТВЕРЖДЕНИЕ.docx")
+    return _gen(events_data, template_path=template)
 
 async def admin_export_spravka(update, ctx):
     query = update.callback_query
@@ -779,8 +794,13 @@ def main():
     member_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_member, pattern="^admin_add_member$")],
         states={
-            WAIT_MEMBER_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_member_name)],
+            WAIT_MEMBER_NAME: [
+                CallbackQueryHandler(member_one,          pattern="^member_one$"),
+                CallbackQueryHandler(member_excel_prompt, pattern="^member_excel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, got_member_name),
+            ],
             WAIT_MEMBER_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_member_group)],
+            WAIT_EXCEL: [MessageHandler(filters.Document.ALL, got_excel)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
