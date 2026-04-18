@@ -1,4 +1,4 @@
-import os, json, csv, io, asyncio, subprocess, tempfile
+import os, json, csv, io, asyncio, tempfile
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -658,20 +658,62 @@ async def send_reminders(app):
 
 # ── Генерация справки-подтверждения ──────────────────────────────────────────
 def generate_spravka(events_data):
-    """Генерирует .docx справку по мероприятиям. events_data — список dicts с title,date,location,students"""
-    script_path = os.path.join(os.path.dirname(__file__), "gen_spravka.js")
-    out_path = tempfile.mktemp(suffix=".docx")
-    payload = json.dumps({"events": events_data})
-    result = subprocess.run(
-        ["node", script_path, payload, out_path],
-        capture_output=True, text=True, timeout=30
-    )
-    if result.returncode != 0 or not os.path.exists(out_path):
-        raise RuntimeError(f"Ошибка генерации: {result.stderr}")
-    with open(out_path, "rb") as f:
-        data = f.read()
-    os.remove(out_path)
-    return data
+    """Генерирует .docx справку на чистом Python через python-docx"""
+    from docx import Document
+    from docx.shared import Pt, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+
+    # Поля страницы
+    section = doc.sections[0]
+    section.top_margin    = Cm(2)
+    section.bottom_margin = Cm(2)
+    section.left_margin   = Cm(3)
+    section.right_margin  = Cm(1.5)
+
+    def add(text, bold=False, align=WD_ALIGN_PARAGRAPH.LEFT, size=12, center=False):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER if center else align
+        run = p.add_run(text)
+        run.bold = bold
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(size)
+        return p
+
+    for i, ev in enumerate(events_data):
+        if i > 0:
+            doc.add_page_break()
+
+        add("МИНИСТЕРСТВО ОБРАЗОВАНИЯ И НАУКИ", bold=True, center=True)
+        add("РЕСПУБЛИКИ ДАГЕСТАН", bold=True, center=True)
+        add("ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ПРОФЕССИОНАЛЬНОЕ ОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ РЕСПУБЛИКИ ДАГЕСТАН", bold=True, center=True)
+        add("«ТЕХНИЧЕСКИЙ КОЛЛЕДЖ ИМЕНИ Р.Н. АШУРАЛИЕВА»", bold=True, center=True)
+        add("(ГБПОУ РД «ТК им. Р.Н. Ашуралиева»)", center=True)
+        add("")
+        add("367013, г. Махачкала, Студенческий переулок, 3, тел.: (8722)68-16-04, e-mail: rpk-05@mail.ru,  http://www.therpk.ru", center=True, size=10)
+        add("")
+        add("СПРАВКА-ПОДТВЕРЖДЕНИЕ", bold=True, center=True)
+        add("")
+        add(f"В рамках мероприятия медиа-направления «Профессионалитет», проведенного {ev['date']} в {ev['location']} обучающиеся:")
+        for student in ev["students"]:
+            add(student)
+        add("в указанный период отсутствовали на учебных занятиях по уважительной причине в связи с участием в мероприятии.")
+        add("")
+        add("Справка выдана для предоставления кураторам и преподавателям.")
+        add("")
+        add("")
+        add("Директор                                                                       Рахманова М.М.")
+        add("")
+        add("")
+        add("")
+        add("Исполнитель: Магомедова М.Д.")
+        add("8-928-055-90-38")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
 
 async def admin_export_spravka(update, ctx):
     query = update.callback_query
