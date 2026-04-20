@@ -123,6 +123,7 @@ def parse_event_datetime(date_str):
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
     user = update.effective_user
     if is_admin(user.id):
         data = load_data()
@@ -162,6 +163,8 @@ async def show_main_menu(message, fio):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
+    return ConversationHandler.END
+
 
 # ── Регистрация ───────────────────────────────────────────────────────────────
 async def got_reg_fio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
