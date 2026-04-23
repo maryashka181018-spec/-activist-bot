@@ -123,6 +123,7 @@ def parse_event_datetime(date_str):
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
     user = update.effective_user
     if is_admin(user.id):
         data = load_data()
@@ -162,6 +163,7 @@ async def show_main_menu(message, fio):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb)
     )
+    return ConversationHandler.END
 
 # ── Регистрация ───────────────────────────────────────────────────────────────
 async def got_reg_fio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -771,12 +773,13 @@ def main():
     reg_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={WAIT_REG_FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_reg_fio)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        allow_reentry=True,
     )
     cert_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_cert_link, pattern="^admin_cert_link$")],
         states={WAIT_CERT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_cert_link)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     add_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add, pattern="^admin_add$")],
@@ -789,7 +792,7 @@ def main():
                 CommandHandler("done", done_roles),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     member_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_add_member, pattern="^admin_add_member$")],
@@ -802,12 +805,12 @@ def main():
             WAIT_MEMBER_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_member_group)],
             WAIT_EXCEL: [MessageHandler(filters.Document.ALL, got_excel)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     remove_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(remove_signup, pattern="^remove_")],
         states={WAIT_REMOVE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_remove_comment)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
     signup_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(signup_start, pattern="^signup_start$")],
@@ -815,7 +818,7 @@ def main():
             CHOOSE_EVENT: [CallbackQueryHandler(choose_event, pattern="^ev_")],
             CHOOSE_ROLE:  [CallbackQueryHandler(choose_role, pattern="^role_")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
 
     app.add_handler(reg_conv)
